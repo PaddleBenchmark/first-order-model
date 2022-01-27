@@ -12,6 +12,8 @@ from sync_batchnorm import DataParallelWithCallback
 
 from frames_dataset import DatasetRepeater
 
+from timer import TimeAverager
+import time
 
 def train(config, generator, discriminator, kp_detector, checkpoint, log_dir, dataset, device_ids):
     train_params = config['train_params']
@@ -36,7 +38,7 @@ def train(config, generator, discriminator, kp_detector, checkpoint, log_dir, da
 
     if 'num_repeats' in train_params or train_params['num_repeats'] != 1:
         dataset = DatasetRepeater(dataset, train_params['num_repeats'])
-    dataloader = DataLoader(dataset, batch_size=train_params['batch_size'], shuffle=True, num_workers=6, drop_last=True)
+    dataloader = DataLoader(dataset, batch_size=train_params['batch_size'], shuffle=True, num_workers=4, drop_last=True)
 
     generator_full = GeneratorFullModel(kp_detector, generator, discriminator, train_params)
     discriminator_full = DiscriminatorFullModel(kp_detector, generator, discriminator, train_params)
@@ -45,35 +47,59 @@ def train(config, generator, discriminator, kp_detector, checkpoint, log_dir, da
         generator_full = DataParallelWithCallback(generator_full, device_ids=device_ids)
         discriminator_full = DataParallelWithCallback(discriminator_full, device_ids=device_ids)
 
+    batch_cost_averager = TimeAverager()
+    reader_cost_averager = TimeAverager()
+
     with Logger(log_dir=log_dir, visualizer_params=config['visualizer_params'], checkpoint_freq=train_params['checkpoint_freq']) as logger:
         for epoch in trange(start_epoch, train_params['num_epochs']):
-            for x in dataloader:
-                losses_generator, generated = generator_full(x)
+            iters = iter(dataloader)
+            while 1:
+                try:
+                    start_time = step_start_time = time.time()
+                    x = next(iters)
+                    reader_cost_averager.record(time.time() - step_start_time)
+                    losses_generator, generated = generator_full(x)
 
-                loss_values = [val.mean() for val in losses_generator.values()]
-                loss = sum(loss_values)
-
-                loss.backward()
-                optimizer_generator.step()
-                optimizer_generator.zero_grad()
-                optimizer_kp_detector.step()
-                optimizer_kp_detector.zero_grad()
-
-                if train_params['loss_weights']['generator_gan'] != 0:
-                    optimizer_discriminator.zero_grad()
-                    losses_discriminator = discriminator_full(x, generated)
-                    loss_values = [val.mean() for val in losses_discriminator.values()]
+                    loss_values = [val.mean() for val in losses_generator.values()]
                     loss = sum(loss_values)
 
                     loss.backward()
-                    optimizer_discriminator.step()
-                    optimizer_discriminator.zero_grad()
-                else:
-                    losses_discriminator = {}
+                    optimizer_generator.step()
+                    optimizer_generator.zero_grad()
+                    optimizer_kp_detector.step()
+                    optimizer_kp_detector.zero_grad()
 
-                losses_generator.update(losses_discriminator)
-                losses = {key: value.mean().detach().data.cpu().numpy() for key, value in losses_generator.items()}
-                logger.log_iter(losses=losses)
+                    if train_params['loss_weights']['generator_gan'] != 0:
+                        optimizer_discriminator.zero_grad()
+                        losses_discriminator = discriminator_full(x, generated)
+                        loss_values = [val.mean() for val in losses_discriminator.values()]
+                        loss = sum(loss_values)
+
+                        loss.backward()
+                        optimizer_discriminator.step()
+                        optimizer_discriminator.zero_grad()
+                    else:
+                        losses_discriminator = {}
+
+                    losses_generator.update(losses_discriminator)
+                    losses = {key: value.mean().detach().data.cpu().numpy() for key, value in losses_generator.items()}
+                    logger.log_iter(losses=losses)
+
+                    batch_cost_averager.record(time.time() - step_start_time,
+                                       num_samples=train_params['batch_size'])
+
+                    message = ""
+                    data_time = reader_cost_averager.get_average()
+                    step_time = batch_cost_averager.get_average()
+                    ips = batch_cost_averager.get_ips_average()
+                    message += 'batch_cost: %.5f sec ' % step_time
+                    message += 'reader_cost: %.5f sec ' % data_time
+                    message += 'ips: %.5f images/s ' % ips
+                    logger.log_file.flush()
+                    batch_cost_averager.reset()
+                    print(message)
+                except StopIteration:
+                    break
 
             scheduler_generator.step()
             scheduler_discriminator.step()
